@@ -38,7 +38,8 @@ struct MutableScalars {
 };
 
 
-struct Undo : MutableScalars {
+struct Undo {
+ MutableScalars scalars;
  bool rolled_back = false;
  std::map<int, bool> entries;
 };
@@ -52,12 +53,12 @@ int main() {
   std::memset(storage, byte, sizeof storage);
   auto* live = new (storage) MutableScalars;
   Undo undo;
-  Copy(up_cast<MutableScalars>(undo), *live);
+  Copy(undo.scalars, *live);
   assert(!undo.rolled_back);
-  Swap(*live, up_cast<MutableScalars>(undo));
+  Swap(*live, undo.scalars);
   assert(!undo.rolled_back);
   undo.rolled_back = true;
-  Swap(*live, up_cast<MutableScalars>(undo));
+  Swap(*live, undo.scalars);
   assert(undo.rolled_back);
   live->~MutableScalars();
  }
