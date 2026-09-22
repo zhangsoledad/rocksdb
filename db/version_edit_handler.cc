@@ -911,8 +911,9 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
       if (negative_edge) {
         builder->RedoLastApply();
       }
-      if (s.IsCorruption()) {
-        // This point in time cannot be recovered; skip it and continue.
+      if (s.IsCorruption() || s.IsPathNotFound() || s.IsNotFound()) {
+        // A file can disappear after verification when the primary compacts.
+        // Skip this unavailable point in time and keep replaying newer edits.
         s = Status::OK();
       }
       builder->CommitLastApply();

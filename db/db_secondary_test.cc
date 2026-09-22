@@ -1164,6 +1164,84 @@ TEST_F(DBSecondaryTest, MissingTableFileDuringOpen) {
   delete iter;
 }
 
+TEST_F(DBSecondaryTest, TableFileDeletedBetweenVerificationAndOpen) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.verify_sst_unique_id_in_manifest = false;
+  options.max_open_files = -1;
+  options.max_file_opening_threads = 1;
+  Reopen(options);
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  ASSERT_OK(Put("foo", "old"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const auto first = metadata.levels[0].files.front();
+  ASSERT_OK(Put("foo", "new"));
+  ASSERT_OK(Flush());
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 2);
+  const auto second = metadata.levels[0].files.front();
+  ASSERT_NE(first.file_number, second.file_number);
+
+  ASSERT_OK(
+      db_->CompactFiles(CompactionOptions(), {first.name, second.name}, 1));
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[1].files.size(), 1);
+  ASSERT_NE(metadata.levels[1].files.front().file_number, first.file_number);
+  ASSERT_NE(metadata.levels[1].files.front().file_number, second.file_number);
+  // The old files are obsolete. Let replay verify the first, then encounter
+  // the missing second file and attempt to save the preceding point in time.
+  ASSERT_OK(env_->DeleteFile(second.db_path + "/" + second.name));
+  bool deleted = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable",
+      [&](void* arg) {
+        auto* file = static_cast<FileMetaData*>(arg);
+        if (!deleted && file->fd.GetNumber() == first.file_number) {
+          ASSERT_OK(env_->DeleteFile(first.db_path + "/" + first.name));
+          deleted = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status = TryOpenSecondary(options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(deleted);
+  ASSERT_OK(status);
+  ASSERT_OK(db_->EnableFileDeletions());
+
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "foo", &value));
+  ASSERT_EQ(value, "new");
+}
+
+TEST_F(DBSecondaryTest, TableOpenIOErrorIsNotSkipped) {
+  Options options;
+  options.env = env_;
+  options.max_open_files = -1;
+  options.max_file_opening_threads = 1;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "value"));
+  ASSERT_OK(Flush());
+
+  bool injected = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::Rep::LoadTableHandlers::AfterFindTable", [&](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("table open failure");
+        injected = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status = TryOpenSecondary(options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(injected);
+  ASSERT_TRUE(status.IsIOError());
+  ASSERT_NE(status.ToString().find("table open failure"), std::string::npos);
+}
+
 TEST_F(DBSecondaryTest, MissingTableFile) {
   Options options;
   options.env = env_;
