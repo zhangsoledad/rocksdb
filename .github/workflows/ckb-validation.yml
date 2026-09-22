@@ -1,0 +1,47 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under both the GPLv2 (found in the
+# COPYING file in the root directory) and Apache 2.0 License
+# (found in the LICENSE.Apache file in the root directory).
+name: CKB native validation
+on:
+  push:
+    branches: [codex/freezer-native-validation]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        status-checking: [normal, checked]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install build and validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang clang-format libclang-dev libgflags-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev ruby python3-yaml
+      - name: Run native checks
+        env:
+          STATUS_CHECKING: ${{ matrix.status-checking }}
+        run: |
+          set -o pipefail
+          if [ "$STATUS_CHECKING" = checked ]; then
+            export ASSERT_STATUS_CHECKED=1
+          fi
+          git remote add upstream https://github.com/facebook/rocksdb.git
+          git fetch upstream main
+          export CLANG_FORMAT_DIFF="python3 /usr/share/clang/clang-format-diff.py"
+          AUTO_CLEAN=1 make -j"$(nproc)" J="$(nproc)" DRIVER="timeout 60" check 2>&1 | tee native-check.log
+      - name: Save native test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.status-checking }}
+          path: |
+            native-check.log
+            LOG
+            t/**
+          retention-days: 30
