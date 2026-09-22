@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        revision: [c3d2a1019ac01606156974dcf309bd6a31d0d538, 06829eccbaaea93632f84d82e5b4352f8edcd497]
+        revision: [4a81bc19c56b41e713bdd8ac2b7fdd076995c791]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -73,12 +73,12 @@ jobs:
 
           results=[]
           with ThreadPoolExecutor(max_workers=4) as pool:
-              for result in pool.map(run,range(1,513)):
+              for result in pool.map(run,range(1,2049)):
                   results.append(result)
                   Path('evidence/results.json').write_text(json.dumps(results,indent=2)+'\n')
                   if result['exit_code'] or result['repeat']%32==0:
                       print(result['repeat'],result['exit_code'],flush=True)
-          assert len(results)==512 and all(result['exit_code']==0 for result in results)
+          assert len(results)==2048 and all(result['exit_code']==0 for result in results)
           PY
       - name: Preserve diagnostic evidence
         if: always()
