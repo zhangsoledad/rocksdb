@@ -28,17 +28,12 @@ jobs:
           mkdir evidence
           git rev-parse HEAD > evidence/commit.txt
           c++ --version > evidence/compiler.txt
+          df -h /dev/shm > evidence/tmpfs.txt
+          lscpu > evidence/cpu.txt
           python3 - <<'PY'
           from pathlib import Path
           p=Path('db/compaction/compaction_service_test.cc')
           source=p.read_text()
-          old='''    if (s.ok()) {
-                return CompactionServiceJobStatus::kSuccess;
-              } else {
-                return CompactionServiceJobStatus::kFailure;
-              }
-          '''
-          old=old.replace('      ', '      ', 1)
           # Locate this exact branch inside MyTestCompactionService::Wait.
           start=source.index('    compaction_num_.fetch_add(1);')
           end=source.index('\n  CompactionServiceOptionsOverride GetOptionsOverride()', start)
@@ -51,22 +46,39 @@ jobs:
           git diff > evidence/diagnostic.patch
           AUTO_CLEAN=1 make -j"$(nproc)" compaction_service_test > evidence/build.log 2>&1
       - name: Repeat the original assertion without retries
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           python3 - <<'PY'
-          import json,subprocess,time
+          from concurrent.futures import ThreadPoolExecutor
+          import json,os,shutil,subprocess,tempfile,time
           from pathlib import Path
-          results=[]
-          for repeat in range(100):
+
+          def run(repeat):
+              directory=tempfile.mkdtemp(prefix='ckb-compaction-',dir='/dev/shm')
               command=['./compaction_service_test','--gtest_filter=CompactionServiceTest.ConcurrentCompaction']
               start=time.monotonic()
-              with Path(f'evidence/{repeat+1}.log').open('w') as log:
-                  result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,timeout=60)
-              results.append({'repeat':repeat+1,'exit_code':result.returncode,'seconds':time.monotonic()-start,'command':command})
-              Path('evidence/results.json').write_text(json.dumps(results,indent=2)+'\n')
-              if result.returncode or (repeat+1)%10==0:
-                  print(repeat+1,result.returncode,flush=True)
-              result.check_returncode()
+              with Path(f'evidence/{repeat}.log').open('w') as log:
+                  try:
+                      result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,
+                                            env={**os.environ,'TEST_TMPDIR':directory},timeout=60)
+                      code=result.returncode
+                  except subprocess.TimeoutExpired:
+                      code=124
+              if code == 0:
+                  shutil.rmtree(directory)
+              else:
+                  shutil.move(directory, f'evidence/failed-{repeat}')
+              return {'repeat':repeat,'exit_code':code,'seconds':time.monotonic()-start,
+                      'command':command,'TEST_TMPDIR':directory}
+
+          results=[]
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              for result in pool.map(run,range(1,513)):
+                  results.append(result)
+                  Path('evidence/results.json').write_text(json.dumps(results,indent=2)+'\n')
+                  if result['exit_code'] or result['repeat']%32==0:
+                      print(result['repeat'],result['exit_code'],flush=True)
+          assert len(results)==512 and all(result['exit_code']==0 for result in results)
           PY
       - name: Preserve diagnostic evidence
         if: always()
