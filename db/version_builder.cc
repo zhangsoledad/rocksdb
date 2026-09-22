@@ -43,14 +43,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Scalar/flag state that a VersionEdit can mutate while being applied. Factored
-// into a small struct so the single-edit undo (VersionBuilder::Rep::EditUndo)
-// can snapshot and restore all of it with a single copy/swap, and so the field
-// list is defined once rather than duplicated between the live state and its
-// undo record. VersionBuilder::Rep inherits this (as does EditUndo) so the
-// scalar state can be snapshotted/restored via up_cast<MutableScalars> with a
-// single copy/swap; Rep is a file-local implementation class, so exposing the
-// base is inconsequential.
+// Scalar state changed by a VersionEdit. Live state and undo records own
+// complete copies, so copying or swapping cannot touch another member stored
+// in base-class tail padding.
 struct MutableScalars {
   // Whether there are invalid new files or invalid deletions on levels larger
   // than num_levels_.
@@ -76,7 +71,9 @@ struct MutableScalars {
   bool version_updated_since_last_check_ = false;
 };
 
-class VersionBuilder::Rep : public MutableScalars {
+class VersionBuilder::Rep {
+  MutableScalars scalars_;
+
   class NewestFirstBySeqNo {
    public:
     bool operator()(const FileMetaData* lhs, const FileMetaData* rhs) const {
@@ -338,12 +335,6 @@ class VersionBuilder::Rep : public MutableScalars {
   // associated blob files are missing.
   std::unordered_set<uint64_t> missing_blob_files_;
 
-  // Note: additional scalar/flag state mutated while applying edits
-  // (has_invalid_levels_, missing_blob_files_high_, valid_version_available_,
-  // edited_in_atomic_group_, version_updated_since_last_check_) lives in the
-  // MutableScalars base so the single-edit undo can snapshot/restore it in one
-  // copy/swap.
-
   // End of fields that are only tracked when `track_found_and_missing_files_`
   // is enabled.
 
@@ -362,7 +353,8 @@ class VersionBuilder::Rep : public MutableScalars {
   // is destroyed during the tentative window. `FileMetaData` removed from
   // `added_files` by a deletion is instead kept alive via `deferred_unref` and
   // only released by `CommitLastApply()`.
-  struct EditUndo : MutableScalars {
+  struct EditUndo {
+    MutableScalars scalars;
     // True while the live state has been rolled back to the pre-edit state
     // (i.e. `ToggleUndo()` has run an odd number of times).
     bool rolled_back = false;
@@ -406,9 +398,6 @@ class VersionBuilder::Rep : public MutableScalars {
     size_t intermediate_files_size = 0;
     std::vector<std::string> intermediate_tail;
 
-    // (Scalar/flag state on the non-live side is held in the MutableScalars
-    // base subobject.)
-
     // `FileMetaData` removed from `added_files` by a deletion in this edit. The
     // ref is held here (not dropped) until `CommitLastApply()`, so a rollback
     // can reinstall the file.
@@ -448,9 +437,9 @@ class VersionBuilder::Rep : public MutableScalars {
       // base will be empty. For manifest tailing usage like secondary instance,
       // they do not allow incomplete version, so the base version in subsequent
       // catch up attempts should be valid too.
-      valid_version_available_ = true;
-      edited_in_atomic_group_ = false;
-      version_updated_since_last_check_ = false;
+      scalars_.valid_version_available_ = true;
+      scalars_.edited_in_atomic_group_ = false;
+      scalars_.version_updated_since_last_check_ = false;
     }
   }
 
@@ -598,8 +587,8 @@ class VersionBuilder::Rep : public MutableScalars {
     assert(!undo_);
     undo_ = std::make_unique<EditUndo>();
     undo_->intermediate_files_size = intermediate_files_.size();
-    // Snapshot the pre-edit scalars (the MutableScalars base subobject).
-    up_cast<MutableScalars>(*undo_) = up_cast<MutableScalars>(*this);
+    // Snapshot the pre-edit scalar state.
+    undo_->scalars = scalars_;
 
     auto touch_table_file = [&](int level, uint64_t fn) {
       RecordMapEntry(table_file_levels_, undo_->table_file_levels, fn);
@@ -713,8 +702,8 @@ class VersionBuilder::Rep : public MutableScalars {
       undo_->intermediate_tail.clear();
     }
 
-    // Swap the scalar/flag state (the MutableScalars base subobject).
-    std::swap(up_cast<MutableScalars>(*this), up_cast<MutableScalars>(*undo_));
+    // Swap the scalar state.
+    std::swap(scalars_, undo_->scalars);
 
     undo_->rolled_back = !undo_->rolled_back;
   }
@@ -991,7 +980,7 @@ class VersionBuilder::Rep : public MutableScalars {
 
   bool CheckConsistencyForNumLevels() const {
     // Make sure there are no files on or beyond num_levels().
-    if (has_invalid_levels_) {
+    if (scalars_.has_invalid_levels_) {
       return false;
     }
 
@@ -1080,8 +1069,8 @@ class VersionBuilder::Rep : public MutableScalars {
       s = version_edit_handler_->VerifyBlobFile(cfd_, blob_file_number,
                                                 blob_file_addition);
       if (s.IsPathNotFound() || s.IsNotFound() || s.IsCorruption()) {
-        missing_blob_files_high_ =
-            std::max(missing_blob_files_high_, blob_file_number);
+        scalars_.missing_blob_files_high_ =
+            std::max(scalars_.missing_blob_files_high_, blob_file_number);
         missing_blob_files_.insert(blob_file_number);
         s = Status::OK();
       } else if (!s.ok()) {
@@ -1154,7 +1143,7 @@ class VersionBuilder::Rep : public MutableScalars {
 
     if (level != current_level) {
       if (level >= num_levels_) {
-        has_invalid_levels_ = true;
+        scalars_.has_invalid_levels_ = true;
       }
 
       std::ostringstream oss;
@@ -1248,7 +1237,7 @@ class VersionBuilder::Rep : public MutableScalars {
     if (current_level !=
         VersionStorageInfo::FileLocation::Invalid().GetLevel()) {
       if (level >= num_levels_) {
-        has_invalid_levels_ = true;
+        scalars_.has_invalid_levels_ = true;
       }
 
       std::ostringstream oss;
@@ -1426,9 +1415,9 @@ class VersionBuilder::Rep : public MutableScalars {
     }
 
     if (track_found_and_missing_files_ && version_updated) {
-      version_updated_since_last_check_ = true;
-      if (!edited_in_atomic_group_ && edit->IsInAtomicGroup()) {
-        edited_in_atomic_group_ = true;
+      scalars_.version_updated_since_last_check_ = true;
+      if (!scalars_.edited_in_atomic_group_ && edit->IsInAtomicGroup()) {
+        scalars_.edited_in_atomic_group_ = true;
       }
     }
     return Status::OK();
@@ -1613,7 +1602,8 @@ class VersionBuilder::Rep : public MutableScalars {
   // applied, and save the result into *vstorage.
   void SaveBlobFilesTo(VersionStorageInfo* vstorage) const {
     assert(vstorage);
-    assert(!track_found_and_missing_files_ || valid_version_available_);
+    assert(!track_found_and_missing_files_ ||
+           scalars_.valid_version_available_);
 
     assert(base_vstorage_);
     vstorage->ReserveBlob(base_vstorage_->GetBlobFiles().size() +
@@ -1708,14 +1698,14 @@ class VersionBuilder::Rep : public MutableScalars {
   bool ContainsCompleteVersion() const {
     assert(track_found_and_missing_files_);
     return l0_missing_files_.empty() && non_l0_missing_files_.empty() &&
-           (missing_blob_files_high_ == kInvalidBlobFileNumber ||
-            missing_blob_files_high_ < GetMinOldestBlobFileNumber());
+           (scalars_.missing_blob_files_high_ == kInvalidBlobFileNumber ||
+            scalars_.missing_blob_files_high_ < GetMinOldestBlobFileNumber());
   }
 
   bool HasMissingFiles() const {
     assert(track_found_and_missing_files_);
     return !l0_missing_files_.empty() || !non_l0_missing_files_.empty() ||
-           missing_blob_files_high_ != kInvalidBlobFileNumber;
+           scalars_.missing_blob_files_high_ != kInvalidBlobFileNumber;
   }
 
   std::vector<std::string>& GetAndClearIntermediateFiles() {
@@ -1824,15 +1814,16 @@ class VersionBuilder::Rep : public MutableScalars {
 
   bool ValidVersionAvailable() {
     assert(track_found_and_missing_files_);
-    if (version_updated_since_last_check_) {
-      valid_version_available_ = ContainsCompleteVersion();
-      if (!valid_version_available_ && !edited_in_atomic_group_ &&
+    if (scalars_.version_updated_since_last_check_) {
+      scalars_.valid_version_available_ = ContainsCompleteVersion();
+      if (!scalars_.valid_version_available_ &&
+          !scalars_.edited_in_atomic_group_ &&
           allow_incomplete_valid_version_) {
-        valid_version_available_ = OnlyMissingL0Suffix();
+        scalars_.valid_version_available_ = OnlyMissingL0Suffix();
       }
-      version_updated_since_last_check_ = false;
+      scalars_.version_updated_since_last_check_ = false;
     }
-    return valid_version_available_;
+    return scalars_.valid_version_available_;
   }
 
   bool OnlyMissingL0Suffix() const {
@@ -1926,7 +1917,8 @@ class VersionBuilder::Rep : public MutableScalars {
 
   // Save the current state in *vstorage.
   Status SaveTo(VersionStorageInfo* vstorage) const {
-    assert(!track_found_and_missing_files_ || valid_version_available_);
+    assert(!track_found_and_missing_files_ ||
+           scalars_.valid_version_available_);
     Status s;
 
 #ifndef NDEBUG
@@ -1959,7 +1951,8 @@ class VersionBuilder::Rep : public MutableScalars {
                            size_t max_file_size_for_l0_meta_pin,
                            const ReadOptions& read_options) {
     assert(table_cache_ != nullptr);
-    assert(!track_found_and_missing_files_ || valid_version_available_);
+    assert(!track_found_and_missing_files_ ||
+           scalars_.valid_version_available_);
 
     size_t table_cache_capacity =
         table_cache_->get_cache().get()->GetCapacity();
