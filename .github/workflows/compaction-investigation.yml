@@ -1,0 +1,77 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under both the GPLv2 (found in the
+# COPYING file in the root directory) and Apache 2.0 License
+# (found in the LICENSE.Apache file in the root directory).
+name: Concurrent compaction investigation
+on:
+  push:
+    branches: [codex/freezer-compaction-investigation]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [c3d2a1019ac01606156974dcf309bd6a31d0d538, 06829eccbaaea93632f84d82e5b4352f8edcd497]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.revision }}
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libgflags-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
+      - name: Capture the underlying remote compactor failure
+        run: |
+          mkdir evidence
+          git rev-parse HEAD > evidence/commit.txt
+          c++ --version > evidence/compiler.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('db/compaction/compaction_service_test.cc')
+          source=p.read_text()
+          old='''    if (s.ok()) {
+                return CompactionServiceJobStatus::kSuccess;
+              } else {
+                return CompactionServiceJobStatus::kFailure;
+              }
+          '''
+          old=old.replace('      ', '      ', 1)
+          # Locate this exact branch inside MyTestCompactionService::Wait.
+          start=source.index('    compaction_num_.fetch_add(1);')
+          end=source.index('\n  CompactionServiceOptionsOverride GetOptionsOverride()', start)
+          body=source[start:end]
+          target='      return CompactionServiceJobStatus::kFailure;'
+          assert body.count(target)==1
+          body=body.replace(target, '      fprintf(stderr, "OpenAndCompact job %s: %s\\n", scheduled_job_id.c_str(), s.ToString().c_str());\n'+target)
+          p.write_text(source[:start]+body+source[end:])
+          PY
+          git diff > evidence/diagnostic.patch
+          AUTO_CLEAN=1 make -j"$(nproc)" compaction_service_test > evidence/build.log 2>&1
+      - name: Repeat the original assertion without retries
+        timeout-minutes: 15
+        run: |
+          python3 - <<'PY'
+          import json,subprocess,time
+          from pathlib import Path
+          results=[]
+          for repeat in range(100):
+              command=['./compaction_service_test','--gtest_filter=CompactionServiceTest.ConcurrentCompaction']
+              start=time.monotonic()
+              with Path(f'evidence/{repeat+1}.log').open('w') as log:
+                  result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,timeout=60)
+              results.append({'repeat':repeat+1,'exit_code':result.returncode,'seconds':time.monotonic()-start,'command':command})
+              Path('evidence/results.json').write_text(json.dumps(results,indent=2)+'\n')
+              if result.returncode or (repeat+1)%10==0:
+                  print(repeat+1,result.returncode,flush=True)
+              result.check_returncode()
+          PY
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compaction-${{ matrix.revision }}
+          path: evidence
+          retention-days: 30
