@@ -1,0 +1,20 @@
+name: Native scalar reproduction
+on:
+  push:
+    branches: [codex/freezer-native-repro]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          set -e
+          for compiler in g++ clang++; do
+            "$compiler" --version
+            for flags in "" "-fno-elide-constructors"; do
+              "$compiler" -std=c++20 -O2 -I. -Iinclude $flags scalar_probe.cc -o scalar_probe
+              ./scalar_probe
+            done
+          done
