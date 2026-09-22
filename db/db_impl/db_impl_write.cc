@@ -2666,6 +2666,14 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     }
     MaybeFlushStatsCF(&cfds);
   }
+  // Dropping the last CF that needed an old WAL can leave the persisted
+  // minimum WAL number behind every live CF. Still schedule a flush: an empty
+  // request would leave getting_flushed set forever, disabling the WAL limit.
+  // Flushing the default CF, even if empty, advances the recovery metadata
+  // through the normal durable flush path.
+  if (cfds.empty()) {
+    cfds.push_back(versions_->GetColumnFamilySet()->GetDefault());
+  }
   WriteThread::Writer nonmem_w;
   if (two_write_queues_) {
     nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
